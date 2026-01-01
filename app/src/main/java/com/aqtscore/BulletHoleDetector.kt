@@ -41,6 +41,21 @@ class BulletHoleDetector {
         private const val HOUGH_CIRCLES_MIN_DIST = 20.0
         private const val HOUGH_CIRCLES_PARAM1 = 100.0
         private const val HOUGH_CIRCLES_PARAM2 = 30.0
+
+        // Project Appleseed AQT Target specifications (25m scaled target)
+        // The AQT target has four circles with the following diameters (in MOA):
+        // - Center bullseye: 4 MOA (approx 1.05" or 26.67mm at 25m)
+        // - Inner ring: extends to 8 MOA (approx 2.09" or 53.34mm at 25m)
+        // - Outer scoring ring: 16 MOA diameter (approx 4.19" or 106.68mm at 25m)
+        // Actual printed AQT 25m target dimensions:
+        // - Black center circle: 1" diameter (25.4mm)
+        // - Inner white ring edge: 2" diameter (50.8mm)
+        // - Outer black ring edge: 4" diameter (101.6mm)
+
+        // These will be calculated as ratios of the detected target size
+        private const val AQT_CENTER_RATIO = 0.125    // 1" / 8" target diameter
+        private const val AQT_INNER_RATIO = 0.25      // 2" / 8" target diameter
+        private const val AQT_OUTER_RATIO = 0.50      // 4" / 8" target diameter
     }
 
     /**
@@ -140,8 +155,14 @@ class BulletHoleDetector {
     }
 
     /**
-     * Calculates score based on distance from target center
-     * Standard bullseye scoring: 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0
+     * Calculates score based on Project Appleseed AQT target specifications
+     * AQT Scoring (25m target):
+     * - 5 points: Center black circle (1" diameter)
+     * - 4 points: Inner white ring (1"-2" diameter)
+     * - 3 points: Outer black ring (2"-4" diameter)
+     * - 0 points: Outside scoring rings
+     *
+     * Note: Shots that "break" or touch a scoring line count for the higher value
      */
     private fun calculateScore(
         hole: BulletHole,
@@ -151,34 +172,40 @@ class BulletHoleDetector {
     ): Int {
         val dx = hole.x - targetCenter.x
         val dy = hole.y - targetCenter.y
-        val distance = sqrt(dx.pow(2) + dy.pow(2))
+        val distanceFromCenter = sqrt(dx.pow(2) + dy.pow(2))
 
-        // Estimate target radius based on image size
-        val targetRadius = minOf(imageWidth, imageHeight) / 2.0
+        // Estimate target diameter based on image size
+        // Assuming the target fills most of the frame
+        val estimatedTargetDiameter = minOf(imageWidth, imageHeight) * 0.9
 
-        // Divide target into 11 zones (10 to 0)
-        val ringWidth = targetRadius / 11.0
+        // Calculate actual zone radii based on AQT ratios
+        val centerRadius = estimatedTargetDiameter * AQT_CENTER_RATIO
+        val innerRadius = estimatedTargetDiameter * AQT_INNER_RATIO
+        val outerRadius = estimatedTargetDiameter * AQT_OUTER_RATIO
 
+        // Account for bullet diameter when scoring (edge of bullet breaks the line)
+        // .30 caliber = 7.62mm diameter
+        val bulletRadius = hole.radius.toDouble()
+
+        // Calculate edge-to-center distance (closest edge of bullet to center)
+        val edgeDistance = distanceFromCenter - bulletRadius
+
+        // Score based on which zone the bullet edge reaches
         val score = when {
-            distance <= ringWidth -> 10
-            distance <= ringWidth * 2 -> 9
-            distance <= ringWidth * 3 -> 8
-            distance <= ringWidth * 4 -> 7
-            distance <= ringWidth * 5 -> 6
-            distance <= ringWidth * 6 -> 5
-            distance <= ringWidth * 7 -> 4
-            distance <= ringWidth * 8 -> 3
-            distance <= ringWidth * 9 -> 2
-            distance <= ringWidth * 10 -> 1
-            else -> 0
+            edgeDistance <= centerRadius -> 5      // Center black (5 points)
+            edgeDistance <= innerRadius -> 4       // Inner white ring (4 points)
+            edgeDistance <= outerRadius -> 3       // Outer black ring (3 points)
+            else -> 0                               // Miss (0 points)
         }
 
-        Log.d(TAG, "Hole at (${hole.x}, ${hole.y}), distance: $distance, score: $score")
+        Log.d(TAG, "Hole at (${hole.x}, ${hole.y}), distance: $distanceFromCenter, " +
+                "edge distance: $edgeDistance, centerR: $centerRadius, " +
+                "innerR: $innerRadius, outerR: $outerRadius, score: $score")
         return score
     }
 
     /**
-     * Draws annotations on the target image
+     * Draws annotations on the target image including AQT scoring zones
      */
     private fun drawAnnotations(
         mat: Mat,
@@ -186,9 +213,54 @@ class BulletHoleDetector {
         targetCenter: Point,
         scores: List<Int>
     ) {
-        // Draw target center
+        // Calculate AQT zone radii for visualization
+        val estimatedTargetDiameter = minOf(mat.width(), mat.height()) * 0.9
+        val centerRadius = estimatedTargetDiameter * AQT_CENTER_RATIO
+        val innerRadius = estimatedTargetDiameter * AQT_INNER_RATIO
+        val outerRadius = estimatedTargetDiameter * AQT_OUTER_RATIO
+
+        // Draw AQT scoring zones (semi-transparent overlays)
+        // Outer ring (3 points) - cyan
+        Imgproc.circle(mat, targetCenter, outerRadius.toInt(), Scalar(255.0, 255.0, 0.0), 2)
+
+        // Inner ring (4 points) - blue
+        Imgproc.circle(mat, targetCenter, innerRadius.toInt(), Scalar(255.0, 128.0, 0.0), 2)
+
+        // Center circle (5 points) - red
+        Imgproc.circle(mat, targetCenter, centerRadius.toInt(), Scalar(255.0, 0.0, 0.0), 2)
+
+        // Draw target center marker
         Imgproc.circle(mat, targetCenter, 5, Scalar(255.0, 0.0, 0.0), -1)
         Imgproc.circle(mat, targetCenter, 10, Scalar(255.0, 0.0, 0.0), 2)
+
+        // Add zone labels
+        Imgproc.putText(
+            mat,
+            "5pts",
+            Point(targetCenter.x + centerRadius + 5, targetCenter.y),
+            Imgproc.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            Scalar(255.0, 255.0, 255.0),
+            2
+        )
+        Imgproc.putText(
+            mat,
+            "4pts",
+            Point(targetCenter.x + innerRadius + 5, targetCenter.y),
+            Imgproc.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            Scalar(255.0, 255.0, 255.0),
+            2
+        )
+        Imgproc.putText(
+            mat,
+            "3pts",
+            Point(targetCenter.x + outerRadius + 5, targetCenter.y),
+            Imgproc.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            Scalar(255.0, 255.0, 255.0),
+            2
+        )
 
         // Draw each bullet hole with .30 caliber circle
         bulletHoles.forEachIndexed { index, hole ->
@@ -223,12 +295,26 @@ class BulletHoleDetector {
                 2
             )
 
-            // Draw score label
+            // Draw score label with background for visibility
             if (index < scores.size) {
+                val text = "${scores[index]}pt"
+                val textPos = Point(hole.x + 20.0, hole.y - 20.0)
+
+                // Draw text background (black rectangle)
+                val textSize = Imgproc.getTextSize(text, Imgproc.FONT_HERSHEY_SIMPLEX, 0.7, 2, intArrayOf(0))
+                Imgproc.rectangle(
+                    mat,
+                    Point(textPos.x - 2, textPos.y - textSize.height - 2),
+                    Point(textPos.x + textSize.width + 2, textPos.y + 4),
+                    Scalar(0.0, 0.0, 0.0),
+                    -1
+                )
+
+                // Draw score text (white)
                 Imgproc.putText(
                     mat,
-                    scores[index].toString(),
-                    Point(hole.x + 20.0, hole.y - 20.0),
+                    text,
+                    textPos,
                     Imgproc.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     Scalar(255.0, 255.0, 255.0),
